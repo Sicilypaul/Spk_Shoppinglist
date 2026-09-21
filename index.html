@@ -428,8 +428,9 @@
 <div id="setup-screen">
   <div class="setup-card">
     <h1 class="setup-title">Daily Shopping List</h1>
-    <p class="setup-sub">Enter your phone number or email — this becomes your personal list. Use the same one next time to come back to it.</p>
-    <input class="setup-code-input" id="setup-code-input" placeholder="Phone number or email" maxlength="60" autocapitalize="none" autocomplete="off">
+    <p class="setup-sub" id="setup-sub">Enter your phone number or email — this becomes your personal list. Use the same one next time to come back to it.</p>
+    <input class="setup-code-input" id="setup-code-input" placeholder="Enter Phone or Email to share with" maxlength="60" autocapitalize="none" autocomplete="off">
+    <input class="setup-code-input" id="setup-pin-input" placeholder="Choose a 4-6 digit PIN" maxlength="6" inputmode="numeric" type="password" autocomplete="off" style="display:none;">
     <button class="setup-join-btn" id="setup-join-btn">Continue</button>
     <p class="setup-error" id="setup-error"></p>
   </div>
@@ -1002,13 +1003,25 @@
     return raw.trim().toLowerCase().replace(/[.#$\[\]\/\s+\-()]/g, '');
   }
 
+  function hashPin(pin, salt) {
+    var enc = new TextEncoder().encode(salt + ':pin:' + pin);
+    return crypto.subtle.digest('SHA-256', enc).then(function (buf) {
+      return Array.prototype.map.call(new Uint8Array(buf), function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+    });
+  }
+
   var setupScreen = document.getElementById('setup-screen');
   var appRoot = document.getElementById('app');
   var codePill = document.getElementById('code-pill');
   var switchListBtn = document.getElementById('switch-list-btn');
+  var setupSub = document.getElementById('setup-sub');
   var setupJoinBtn = document.getElementById('setup-join-btn');
   var setupCodeInput = document.getElementById('setup-code-input');
+  var setupPinInput = document.getElementById('setup-pin-input');
   var setupError = document.getElementById('setup-error');
+  var pendingKey = null;
+  var pendingRaw = null;
+  var setupStep = 'identify';
 
   function startAppWithCode(code, rawDisplay) {
     LIST_CODE = code;
@@ -1019,6 +1032,16 @@
     codePill.textContent = rawDisplay || code;
     load();
     pollTimer = setInterval(function () { load(); }, 4000);
+  }
+
+  function resetToIdentifyStep() {
+    setupStep = 'identify';
+    setupCodeInput.style.display = '';
+    setupPinInput.style.display = 'none';
+    setupPinInput.value = '';
+    setupJoinBtn.textContent = 'Continue';
+    setupSub.textContent = 'Enter your phone number or email — this becomes your personal list. Use the same one next time to come back to it.';
+    setupError.textContent = '';
   }
 
   codePill.addEventListener('click', function () {
@@ -1043,11 +1066,11 @@
       appRoot.style.display = 'none';
       setupScreen.style.display = 'flex';
       setupCodeInput.value = '';
-      setupError.textContent = '';
+      resetToIdentifyStep();
     }
   });
 
-  setupJoinBtn.addEventListener('click', function () {
+  function handleIdentifyStep() {
     var raw = setupCodeInput.value.trim();
     var key = sanitizeKey(raw);
     if (key.length < 4) {
@@ -1055,10 +1078,89 @@
       return;
     }
     setupError.textContent = '';
-    startAppWithCode(key, raw);
+    setupJoinBtn.disabled = true;
+    fetch(FIREBASE_URL + '/lists/' + key + '/pin.json')
+      .then(function (r) { return r.json(); })
+      .then(function (pinData) {
+        setupJoinBtn.disabled = false;
+        pendingKey = key;
+        pendingRaw = raw;
+        if (pinData && pinData.hash) {
+          setupStep = 'verify';
+          setupCodeInput.style.display = 'none';
+          setupPinInput.style.display = '';
+          setupPinInput.placeholder = 'Enter the PIN for this list';
+          setupPinInput.value = '';
+          setupSub.textContent = 'This list is protected. Enter its PIN to continue.';
+          setupJoinBtn.textContent = 'Unlock';
+          setupPinInput.focus();
+        } else {
+          setupStep = 'create';
+          setupCodeInput.style.display = 'none';
+          setupPinInput.style.display = '';
+          setupPinInput.placeholder = 'Choose a 4-6 digit PIN';
+          setupPinInput.value = '';
+          setupSub.textContent = 'Set a PIN to protect this list — anyone joining will need it.';
+          setupJoinBtn.textContent = 'Set PIN & Continue';
+          setupPinInput.focus();
+        }
+      })
+      .catch(function () {
+        setupJoinBtn.disabled = false;
+        setupError.textContent = 'Could not reach the server, try again';
+      });
+  }
+
+  function handleVerifyStep() {
+    var pin = setupPinInput.value.trim();
+    if (!pin) { setupError.textContent = 'Enter the PIN'; return; }
+    setupJoinBtn.disabled = true;
+    hashPin(pin, pendingKey).then(function (hash) {
+      fetch(FIREBASE_URL + '/lists/' + pendingKey + '/pin.json')
+        .then(function (r) { return r.json(); })
+        .then(function (pinData) {
+          setupJoinBtn.disabled = false;
+          if (pinData && pinData.hash === hash) {
+            startAppWithCode(pendingKey, pendingRaw);
+          } else {
+            setupError.textContent = 'Incorrect PIN, try again';
+          }
+        });
+    });
+  }
+
+  function handleCreateStep() {
+    var pin = setupPinInput.value.trim();
+    if (pin.length < 4 || pin.length > 6 || !/^\d+$/.test(pin)) {
+      setupError.textContent = 'PIN must be 4-6 digits';
+      return;
+    }
+    setupJoinBtn.disabled = true;
+    hashPin(pin, pendingKey).then(function (hash) {
+      return fetch(FIREBASE_URL + '/lists/' + pendingKey + '/pin.json', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hash: hash })
+      });
+    }).then(function () {
+      setupJoinBtn.disabled = false;
+      startAppWithCode(pendingKey, pendingRaw);
+    }).catch(function () {
+      setupJoinBtn.disabled = false;
+      setupError.textContent = 'Could not save PIN, try again';
+    });
+  }
+
+  setupJoinBtn.addEventListener('click', function () {
+    if (setupStep === 'identify') handleIdentifyStep();
+    else if (setupStep === 'verify') handleVerifyStep();
+    else if (setupStep === 'create') handleCreateStep();
   });
 
   setupCodeInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') setupJoinBtn.click();
+  });
+  setupPinInput.addEventListener('keydown', function (e) {
     if (e.key === 'Enter') setupJoinBtn.click();
   });
 
